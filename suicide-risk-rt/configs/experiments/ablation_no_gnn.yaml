@@ -1,0 +1,2 @@
+model:
+  use_gnn: false

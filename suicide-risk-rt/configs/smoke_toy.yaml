@@ -1,0 +1,67 @@
+project:
+  name: srrtd
+  seed: 42
+  device: auto
+  output_dir: outputs
+  model_dir: models
+
+data:
+  source: toy
+  dataset_confirmed: false
+
+privacy:
+  mask_emails: true
+  mask_phones: true
+  mask_urls: true
+  mask_handles: true
+  normalize_whitespace: true
+  max_chars: 2048
+
+labels:
+  risk_classes: ["low", "medium", "high"]
+  emotion_classes: ["neutral", "sadness", "anger", "fear", "joy", "surprise", "disgust"]
+
+model:
+  # fast smoke-test encoder (smaller download). Full system uses configs/default.yaml
+  encoder_name: "distilroberta-base"
+  max_length: 128
+  dropout: 0.1
+  use_memory: false
+  memory:
+    short_window: 8
+    long_ema_decay: 0.98
+    user_state_dim: 256
+  use_rag: false
+  rag:
+    embed_model: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    embed_dim: 384
+    top_k: 5
+    chroma_dir: "outputs/chroma"
+    collection: "srrtd_posts"
+  use_gnn: false
+  gnn:
+    hidden_dim: 128
+    num_layers: 2
+    dropout: 0.1
+    max_neighbors: 16
+
+train:
+  batch_size: 16
+  lr: 3.0e-5
+  weight_decay: 0.01
+  epochs: 1
+  warmup_ratio: 0.06
+  fp16: false
+  grad_accum: 1
+  max_steps: 60
+  val_ratio: 0.1
+  test_ratio: 0.1
+  loss_weights:
+    risk: 1.0
+    emotion: 0.5
+
+inference:
+  threshold_high: 0.55
+  enable_support_module: true
+  store_user_state: true
+  state_ttl_seconds: 86400
