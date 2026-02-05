@@ -1,0 +1,118 @@
+project:
+  name: srrtd
+  seed: 42
+  device: auto
+  output_dir: outputs
+  model_dir: models
+
+data:
+  mode: multitask
+  # IMPORTANT: must be true to use any non-toy datasets.
+  dataset_confirmed: true
+  confirmation:
+    risk_dataset_name: "<fill me>"
+    risk_source: "<kaggle/hf/url or citation>"
+    risk_license: "<license/access terms>"
+    emotion_dataset_name: "<fill me>"
+    emotion_source: "<hf dataset id/url>"
+    emotion_license: "<license/access terms>"
+
+  multitask:
+    risk:
+      # Put these files under data/raw/risk/
+      train_path: data/raw/risk/train.csv
+      val_path: data/raw/risk/val.csv
+      test_path: data/raw/risk/test.csv
+      text_field: text
+      label_field: class
+      # Recommended: explicit mapping so labels never get misread.
+      # Example values shown; replace to match your CSV exactly.
+      label_map:
+        non-suicide: 0
+        suicide: 1
+      # Optional: cap huge datasets for faster iteration.
+      max_train_samples: 200000
+      max_val_samples: 20000
+      max_test_samples: 20000
+
+    emotion:
+      # Put these files under data/raw/emotion/
+      train_path: data/raw/emotion/train.csv
+      val_path: data/raw/emotion/val.csv
+      test_path: data/raw/emotion/test.csv
+      text_field: text
+      label_field: label
+      # If your emotion labels are already integers, you can omit label_map.
+      # If they are strings, either fill label_map OR set labels.emotion_classes below.
+      # label_map:
+      #   happines: 1
+      #   sad: 3
+      max_train_samples: -1
+      max_val_samples: -1
+      max_test_samples: -1
+
+  cleaning:
+    drop_deleted: true
+    min_text_len: 10
+    deduplicate: false
+
+privacy:
+  mask_emails: true
+  mask_phones: true
+  mask_urls: true
+  mask_handles: true
+  normalize_whitespace: true
+  max_chars: 2048
+
+labels:
+  # For binary risk:
+  risk_classes: ["non-suicide", "suicide"]
+  # Emotion labels (canonical). Your dataset has 7 core labels + a rare 'excited'.
+  emotion_classes: ["sadness", "joy", "love", "anger", "fear", "surprise"]
+
+model:
+  encoder_name: xlm-roberta-base
+  max_length: 256
+  dropout: 0.1
+  use_memory: true
+  memory:
+    short_window: 8
+    long_ema_decay: 0.98
+    user_state_dim: 256
+  use_rag: false
+  rag:
+    embed_model: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+    embed_dim: 384
+    top_k: 5
+    chroma_dir: outputs/chroma
+    collection: srrtd_posts
+  use_gnn: false
+  gnn:
+    hidden_dim: 128
+    num_layers: 2
+    dropout: 0.1
+    max_neighbors: 16
+
+train:
+  batch_size: 8
+  lr: 2.0e-5
+  weight_decay: 0.01
+  epochs: 3
+  warmup_ratio: 0.06
+  fp16: false
+  grad_accum: 1
+  max_steps: -1
+  loss_weights:
+    risk: 1.0
+    emotion: 1.0
+  multitask:
+    # Probability that a training step uses an emotion batch (else uses risk batch).
+    p_emotion: 0.0
+    # If set > 0, overrides default steps_per_epoch (which is len(risk_train_loader)).
+    steps_per_epoch: -1
+
+inference:
+  threshold_high: 0.55
+  enable_support_module: true
+  store_user_state: true
+  state_ttl_seconds: 86400

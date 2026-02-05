@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -14,16 +15,375 @@ class DatasetConfirmationRequired(RuntimeError):
     pass
 
 
+def _cleaning_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
+    d = dict(cfg.get("data", {}) or {})
+    c = dict(d.get("cleaning", {}) or {})
+    return {
+        "drop_deleted": bool(c.get("drop_deleted", True)),
+        "min_text_len": int(c.get("min_text_len", 10)),
+        "deduplicate": bool(c.get("deduplicate", False)),
+    }
+
+
+def _is_deleted_placeholder(text: str) -> bool:
+    s = text.strip().lower()
+    return s in {"[deleted]", "[removed]", "deleted", "removed"}
+
+
+def _normalize_for_dedupe(text: str) -> str:
+    # Minimal, stable normalization for dedupe keys.
+    return " ".join(str(text).split()).strip().lower()
+
+
 def _require_confirmation(data_cfg: dict[str, Any]) -> None:
-    source = str(data_cfg.get("source", "toy"))
-    if source == "toy":
-        return
+    mode = str(data_cfg.get("mode", "single")).lower()
+    if mode == "single":
+        source = str(data_cfg.get("source", "toy"))
+        if source == "toy":
+            return
+    elif mode == "multitask":
+        # multitask always implies external/local data
+        pass
+    else:
+        raise ValueError(f"Unknown data.mode='{mode}'")
     confirmed = bool(data_cfg.get("dataset_confirmed", False))
     if not confirmed:
         raise DatasetConfirmationRequired(
             "External dataset usage blocked. Set data.dataset_confirmed=true only after you explicitly confirm: "
             "dataset name, source, expected size, and license/access requirements."
         )
+
+
+def _stable_id(s: str) -> str:
+    h = hashlib.sha1(s.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
+    return h
+
+
+def load_multitask_bundles(cfg: dict[str, Any], project_root: Path) -> tuple[DatasetBundle, DatasetBundle]:
+    """Load two separate datasets for multitask learning.
+
+    Returns: (risk_bundle, emotion_bundle)
+    """
+
+    data_cfg = dict(cfg.get("data", {}) or {})
+    _require_confirmation(data_cfg)
+
+    privacy_cfg = privacy_cfg_from_dict(dict(cfg.get("privacy", {}) or {}))
+    labels_cfg = dict(cfg.get("labels", {}) or {})
+
+    risk_classes = list(labels_cfg.get("risk_classes", ["low", "medium", "high"]))
+    emotion_classes = list(
+        labels_cfg.get(
+            "emotion_classes",
+            ["neutral", "sadness", "anger", "fear", "joy", "surprise", "disgust"],
+        )
+    )
+
+    mt = dict(data_cfg.get("multitask", {}) or {})
+    risk_cfg = dict(mt.get("risk", {}) or {})
+    emo_cfg = dict(mt.get("emotion", {}) or {})
+
+    processed_dir = project_root / "data" / "processed"
+    processed_dir.mkdir(parents=True, exist_ok=True)
+
+    # Cache per task
+    common_cache_bits = {
+        "mode": "multitask",
+        "privacy": asdict(privacy_cfg),
+        "labels": {"risk": risk_classes, "emotion": emotion_classes},
+    }
+    risk_key = {**common_cache_bits, "task": "risk", "cfg": {k: risk_cfg.get(k) for k in sorted(risk_cfg.keys())}}
+    emo_key = {**common_cache_bits, "task": "emotion", "cfg": {k: emo_cfg.get(k) for k in sorted(emo_cfg.keys())}}
+
+    risk_path = cache_path(processed_dir, risk_key)
+    emo_path = cache_path(processed_dir, emo_key)
+    if risk_path.exists() and emo_path.exists():
+        return read_bundle(risk_path), read_bundle(emo_path)
+
+    risk_bundle = _load_multitask_task_bundle(
+        cfg=cfg,
+        project_root=project_root,
+        task="risk",
+        task_cfg=risk_cfg,
+        risk_classes=risk_classes,
+        emotion_classes=emotion_classes,
+    )
+    emo_bundle = _load_multitask_task_bundle(
+        cfg=cfg,
+        project_root=project_root,
+        task="emotion",
+        task_cfg=emo_cfg,
+        risk_classes=risk_classes,
+        emotion_classes=emotion_classes,
+    )
+
+    write_bundle(risk_path, risk_bundle)
+    write_bundle(emo_path, emo_bundle)
+    return risk_bundle, emo_bundle
+
+
+def _infer_format(path: str, explicit: str | None) -> str:
+    if explicit and str(explicit).strip():
+        return str(explicit).strip().lower()
+    suf = Path(path).suffix.lower()
+    if suf == ".csv":
+        return "csv"
+    if suf in (".jsonl", ".json"):
+        return "jsonl"
+    if suf in (".xlsx", ".xls"):
+        return "xlsx"
+    raise ValueError(f"Cannot infer file format from extension '{suf}' for path='{path}'")
+
+
+def _read_table(path: str, fmt: str):
+    import pandas as pd
+
+    if fmt == "csv":
+        encodings = ["utf-8", "utf-8-sig", "cp1252", "latin1"]
+        last_err: Exception | None = None
+        for enc in encodings:
+            try:
+                return pd.read_csv(path, encoding=enc, engine="python", on_bad_lines="skip")
+            except UnicodeDecodeError as e:
+                last_err = e
+        if last_err is not None:
+            raise last_err
+        return pd.read_csv(path, engine="python", on_bad_lines="skip")
+    if fmt == "jsonl":
+        # json lines
+        return pd.read_json(path, lines=True)
+    if fmt == "xlsx":
+        return pd.read_excel(path)
+    raise ValueError(f"Unsupported format '{fmt}'")
+
+
+def _maybe_cap(df, max_samples: int, seed: int):
+    if max_samples is None:
+        return df
+    m = int(max_samples)
+    if m <= 0 or len(df) <= m:
+        return df
+    return df.sample(n=m, random_state=seed).reset_index(drop=True)
+
+
+def _map_risk_label(val: Any, label_map: dict[str, Any] | None) -> int:
+    if val is None:
+        raise ValueError("Risk label is missing")
+    # numeric
+    try:
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            return int(val)
+        s = str(val).strip()
+        if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+            return int(s)
+    except Exception:
+        pass
+
+    s = str(val).strip().lower()
+    if label_map:
+        if s in label_map:
+            return int(label_map[s])
+        # allow original-case keys
+        for k, v in label_map.items():
+            if str(k).strip().lower() == s:
+                return int(v)
+
+    # conservative heuristics for common suicide datasets
+    suicide_tokens = {
+        "suicide",
+        "suicidal",
+        "suicidewatch",
+        "self.suicidewatch",
+        "sw",
+        "1",
+        "true",
+        "yes",
+        "positive",
+    }
+    nonsuicide_tokens = {
+        "non-suicide",
+        "nonsuicide",
+        "non_suicide",
+        "not_suicide",
+        "0",
+        "false",
+        "no",
+        "negative",
+        "depression",
+        "self.depression",
+    }
+    if s in suicide_tokens:
+        return 1
+    if s in nonsuicide_tokens:
+        return 0
+
+    raise ValueError(
+        f"Unrecognized risk label '{val}'. Provide data.multitask.risk.label_map to map string labels -> integers."
+    )
+
+
+def _map_emotion_label(val: Any, emotion_classes: list[str], label_map: dict[str, Any] | None) -> int:
+    if val is None:
+        raise ValueError("Emotion label is missing")
+    try:
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            return int(val)
+        s = str(val).strip()
+        if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+            return int(s)
+    except Exception:
+        pass
+
+    s = str(val).strip().lower()
+    if label_map:
+        if s in label_map:
+            return int(label_map[s])
+        for k, v in label_map.items():
+            if str(k).strip().lower() == s:
+                return int(v)
+
+    # fall back to labels.emotion_classes order
+    norm = [c.strip().lower() for c in emotion_classes]
+    if s in norm:
+        return int(norm.index(s))
+
+    raise ValueError(
+        f"Unrecognized emotion label '{val}'. Add it to labels.emotion_classes or provide data.multitask.emotion.label_map."
+    )
+
+
+def _load_multitask_task_bundle(
+    cfg: dict[str, Any],
+    project_root: Path,
+    task: str,
+    task_cfg: dict[str, Any],
+    risk_classes: list[str],
+    emotion_classes: list[str],
+) -> DatasetBundle:
+    seed = int(cfg.get("project", {}).get("seed", 42))
+    clean_cfg = _cleaning_cfg(cfg)
+
+    train_path = str(task_cfg.get("train_path", "")).strip()
+    val_path = str(task_cfg.get("val_path", "")).strip()
+    test_path = str(task_cfg.get("test_path", "")).strip()
+    if not train_path or not val_path or not test_path:
+        raise ValueError(f"data.multitask.{task}.train_path/val_path/test_path are required")
+
+    # resolve relative to project root
+    def rp(p: str) -> str:
+        pp = Path(p)
+        return str((project_root / pp).resolve()) if not pp.is_absolute() else str(pp)
+
+    train_path = rp(train_path)
+    val_path = rp(val_path)
+    test_path = rp(test_path)
+
+    fmt_train = _infer_format(train_path, task_cfg.get("format"))
+    fmt_val = _infer_format(val_path, task_cfg.get("format"))
+    fmt_test = _infer_format(test_path, task_cfg.get("format"))
+    if not (fmt_train == fmt_val == fmt_test):
+        raise ValueError(f"Split formats must match for task '{task}'")
+    fmt = fmt_train
+
+    text_field = str(task_cfg.get("text_field", "text"))
+    label_field = str(task_cfg.get("label_field", "label"))
+    user_field = str(task_cfg.get("user_field", "user_id"))
+    time_field = str(task_cfg.get("time_field", "timestamp"))
+
+    max_train = int(task_cfg.get("max_train_samples", -1))
+    max_val = int(task_cfg.get("max_val_samples", -1))
+    max_test = int(task_cfg.get("max_test_samples", -1))
+
+    label_map = dict(task_cfg.get("label_map", {}) or {})
+
+    def to_records(df, split_name: str) -> list[PostRecord]:
+        if text_field not in df.columns or label_field not in df.columns:
+            raise ValueError(f"Missing required columns for {task}/{split_name}: '{text_field}', '{label_field}'")
+
+        recs: list[PostRecord] = []
+        seen: set[str] = set()
+        for i, row in df.iterrows():
+            raw_text = row[text_field]
+            if raw_text is None:
+                continue
+            # pandas NaN -> float nan
+            try:
+                import pandas as _pd
+
+                if _pd.isna(raw_text):
+                    continue
+            except Exception:
+                pass
+
+            text = str(raw_text).strip()
+            if not text:
+                continue
+            if clean_cfg["drop_deleted"] and _is_deleted_placeholder(text):
+                continue
+            if len(text) < int(clean_cfg["min_text_len"]):
+                continue
+            if clean_cfg["deduplicate"]:
+                key = _normalize_for_dedupe(text)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+            raw_label = row[label_field]
+
+            if task == "risk":
+                risk = _map_risk_label(raw_label, label_map)
+                # clip into available head size (commonly binary)
+                risk = max(0, min(len(risk_classes) - 1, int(risk)))
+                emotion = 0
+            else:
+                emotion = _map_emotion_label(raw_label, emotion_classes, label_map)
+                emotion = max(0, min(len(emotion_classes) - 1, int(emotion)))
+                risk = 0
+
+            # If missing, create stable ids so memory/GNN can still function.
+            user_id = str(row[user_field]) if user_field in df.columns else f"user_{_stable_id(task + ':' + split_name + ':' + str(i))}"
+            ts = int(row[time_field]) if time_field in df.columns else 1_700_000_000 + int(i)
+            lang = str(row["lang"]) if "lang" in df.columns else "und"
+            recs.append(
+                PostRecord(
+                    text=text,
+                    risk=risk,
+                    emotion=emotion,
+                    user_id=user_id,
+                    timestamp=ts,
+                    lang=lang,
+                    meta={"task": task, "split": split_name},
+                )
+            )
+        return recs
+
+    df_train = _read_table(train_path, fmt)
+    df_val = _read_table(val_path, fmt)
+    df_test = _read_table(test_path, fmt)
+
+    df_train = _maybe_cap(df_train, max_train, seed)
+    df_val = _maybe_cap(df_val, max_val, seed)
+    df_test = _maybe_cap(df_test, max_test, seed)
+
+    train_records = to_records(df_train, "train")
+    val_records = to_records(df_val, "val")
+    test_records = to_records(df_test, "test")
+
+    privacy_cfg = privacy_cfg_from_dict(dict(cfg.get("privacy", {}) or {}))
+    for r in train_records:
+        r.text = privacy_preprocess(r.text, privacy_cfg)
+    for r in val_records:
+        r.text = privacy_preprocess(r.text, privacy_cfg)
+    for r in test_records:
+        r.text = privacy_preprocess(r.text, privacy_cfg)
+
+    return DatasetBundle(
+        train=DatasetSplit(records=train_records),
+        val=DatasetSplit(records=val_records),
+        test=DatasetSplit(records=test_records),
+        risk_classes=risk_classes,
+        emotion_classes=emotion_classes,
+    )
 
 
 def load_dataset_bundle(cfg: dict[str, Any], project_root: Path) -> DatasetBundle:
@@ -76,10 +436,29 @@ def load_dataset_bundle(cfg: dict[str, Any], project_root: Path) -> DatasetBundl
         else:
             raise ValueError(f"Unknown data.source='{source}'")
 
-    # Privacy preprocess text before caching
+    # Clean + privacy preprocess text before caching
+    clean_cfg = _cleaning_cfg(cfg)
     for split in (bundle.train, bundle.val, bundle.test):
+        cleaned: list[PostRecord] = []
+        seen: set[str] = set()
         for r in split.records:
-            r.text = privacy_preprocess(r.text, privacy_cfg)
+            t = str(r.text).strip()
+            if not t:
+                continue
+            if clean_cfg["drop_deleted"] and _is_deleted_placeholder(t):
+                continue
+            if len(t) < int(clean_cfg["min_text_len"]):
+                continue
+            if clean_cfg["deduplicate"]:
+                key = _normalize_for_dedupe(t)
+                if key in seen:
+                    continue
+                seen.add(key)
+            r.text = privacy_preprocess(t, privacy_cfg)
+            cleaned.append(r)
+        split.records = cleaned
+
+    # Note: multitask path applies cleaning and privacy preprocessing inside its loader.
 
     write_bundle(cpath, bundle)
     return bundle

@@ -18,9 +18,9 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from srrtd.data.loader import DatasetConfirmationRequired, load_dataset_bundle
+from srrtd.data.loader import DatasetConfirmationRequired, load_dataset_bundle, load_multitask_bundles
 from srrtd.data.torch_dataset import StreamingPostDataset, collate_tokenized
-from srrtd.eval.metrics import compute_metrics
+from srrtd.eval.metrics import compute_emotion_metrics, compute_metrics, compute_risk_metrics
 from srrtd.models.community import CommunityGraph, CommunityGnnContext
 from srrtd.models.factory import model_config_from_yaml
 from srrtd.models.multitask import SrrtdMultiTaskModel
@@ -59,8 +59,14 @@ def main() -> int:
     seed = int(cfg.get("project", {}).get("seed", 42))
     set_global_seed(seed)
 
+    mode = str(cfg.get("data", {}).get("mode", "single")).lower()
     try:
-        bundle = load_dataset_bundle(cfg, root)
+        if mode == "multitask":
+            risk_bundle, emo_bundle = load_multitask_bundles(cfg, root)
+            bundle = None
+        else:
+            bundle = load_dataset_bundle(cfg, root)
+            risk_bundle, emo_bundle = None, None
     except DatasetConfirmationRequired as e:
         raise SystemExit(str(e))
 
@@ -100,9 +106,17 @@ def main() -> int:
     graph = None
     if model_cfg.use_gnn:
         recs = []
-        for split in (bundle.train, bundle.val, bundle.test):
-            for r in split.records:
-                recs.append({"user_id": r.user_id, "lang": r.lang, "timestamp": r.timestamp})
+        if mode == "multitask":
+            for split in (risk_bundle.train, risk_bundle.val, risk_bundle.test):
+                for r in split.records:
+                    recs.append({"user_id": r.user_id, "lang": r.lang, "timestamp": r.timestamp})
+            for split in (emo_bundle.train, emo_bundle.val, emo_bundle.test):
+                for r in split.records:
+                    recs.append({"user_id": r.user_id, "lang": r.lang, "timestamp": r.timestamp})
+        else:
+            for split in (bundle.train, bundle.val, bundle.test):
+                for r in split.records:
+                    recs.append({"user_id": r.user_id, "lang": r.lang, "timestamp": r.timestamp})
         graph = CommunityGraph.build_from_records(
             records=recs,
             seed=seed,
@@ -124,77 +138,106 @@ def main() -> int:
     test_cfg = dict(cfg.get("train", {}) or {})
     bs = int(test_cfg.get("batch_size", 8))
 
-    ds_test = StreamingPostDataset(bundle.test)
     collate = collate_tokenized(tokenizer, max_length=model_cfg.max_length)
-    dl_test = DataLoader(ds_test, batch_size=bs, shuffle=False, collate_fn=collate)
 
-    risk_logits_l = []
-    emo_logits_l = []
-    risk_y_l = []
-    emo_y_l = []
+    def _run_split(ds: StreamingPostDataset, desc: str):
+        dl = DataLoader(ds, batch_size=bs, shuffle=False, collate_fn=collate)
+        risk_logits_l, emo_logits_l, risk_y_l, emo_y_l = [], [], [], []
+        with torch.no_grad():
+            for batch in tqdm(dl, desc=desc):
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                risk_y = batch["risk"].to(device)
+                emo_y = batch["emotion"].to(device)
+                user_ids = batch["user_ids"]
+                texts = batch["texts"]
+
+                rag_ctx = rag.retrieve_context_vec(texts, device=device) if rag is not None else None
+
+                gnn_add = None
+                if gnn_ctx is not None and graph is not None and model.memory_store is not None:
+                    gnn_add = gnn_ctx(
+                        user_ids=user_ids,
+                        device=device,
+                        graph=graph,
+                        user_state_lookup=lambda uid, dev, dim: model.memory_store.get_long(uid, dev, dim),
+                    )
+
+                out = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    user_ids=user_ids,
+                    update_memory=True,
+                    gnn_context=gnn_add,
+                    rag_context=rag_ctx,
+                )
+
+                risk_logits_l.append(out["risk_logits"].detach().cpu().numpy())
+                emo_logits_l.append(out["emotion_logits"].detach().cpu().numpy())
+                risk_y_l.append(risk_y.detach().cpu().numpy())
+                emo_y_l.append(emo_y.detach().cpu().numpy())
+        return (
+            np.concatenate(risk_logits_l, axis=0),
+            np.concatenate(emo_logits_l, axis=0),
+            np.concatenate(risk_y_l, axis=0),
+            np.concatenate(emo_y_l, axis=0),
+        )
 
     model.reset_streaming_state()
 
-    with torch.no_grad():
-        for batch in tqdm(dl_test, desc="test"):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            risk_y = batch["risk"].to(device)
-            emo_y = batch["emotion"].to(device)
-            user_ids = batch["user_ids"]
-            texts = batch["texts"]
+    if mode == "multitask":
+        # Risk evaluation
+        risk_logits, emo_logits, risk_y, emo_y = _run_split(StreamingPostDataset(risk_bundle.test), "test risk")
+        rb, rdetails = compute_risk_metrics(risk_logits, risk_y, ckpt["risk_classes"])
+        _plot_confusion(rdetails["risk_confusion"], ckpt["risk_classes"], "Risk Confusion", out_dir / "risk_confusion.png")
 
-            rag_ctx = None
-            if rag is not None:
-                rag_ctx = rag.retrieve_context_vec(texts, device=device)
+        # Emotion evaluation
+        risk_logits2, emo_logits2, risk_y2, emo_y2 = _run_split(StreamingPostDataset(emo_bundle.test), "test emotion")
+        eb, edetails = compute_emotion_metrics(emo_logits2, emo_y2, ckpt["emotion_classes"])
+        _plot_confusion(
+            edetails["emotion_confusion"],
+            ckpt["emotion_classes"],
+            "Emotion Confusion",
+            out_dir / "emotion_confusion.png",
+        )
 
-            gnn_add = None
-            if gnn_ctx is not None and graph is not None and model.memory_store is not None:
-                gnn_add = gnn_ctx(
-                    user_ids=user_ids,
-                    device=device,
-                    graph=graph,
-                    user_state_lookup=lambda uid, dev, dim: model.memory_store.get_long(uid, dev, dim),
-                )
+        metrics = {
+            "risk_f1_macro": rb.risk_f1_macro,
+            "risk_f1_weighted": rb.risk_f1_weighted,
+            "risk_recall_high": rb.risk_recall_high,
+            "risk_roc_auc_ovr": rb.risk_roc_auc_ovr,
+            "emotion_f1_macro": eb.emotion_f1_macro,
+            "emotion_acc": eb.emotion_acc,
+        }
+        details = {**rdetails, **edetails}
+        with open(out_dir / "metrics.json", "w", encoding="utf-8") as f:
+            json.dump({"metrics": metrics, "details": details}, f, indent=2)
 
-            out = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                user_ids=user_ids,
-                update_memory=True,
-                gnn_context=gnn_add,
-                rag_context=rag_ctx,
-            )
+        print("OK:")
+        for k, v in metrics.items():
+            print(f"  {k}: {v}")
+    else:
+        ds_test = StreamingPostDataset(bundle.test)
+        risk_logits, emo_logits, risk_y, emo_y = _run_split(ds_test, "test")
+        mb, details = compute_metrics(risk_logits, risk_y, emo_logits, emo_y, ckpt["risk_classes"], ckpt["emotion_classes"])
+        metrics = {
+            "risk_f1_macro": mb.risk_f1_macro,
+            "risk_f1_weighted": mb.risk_f1_weighted,
+            "risk_recall_high": mb.risk_recall_high,
+            "risk_roc_auc_ovr": mb.risk_roc_auc_ovr,
+            "emotion_f1_macro": mb.emotion_f1_macro,
+            "emotion_acc": mb.emotion_acc,
+        }
 
-            risk_logits_l.append(out["risk_logits"].detach().cpu().numpy())
-            emo_logits_l.append(out["emotion_logits"].detach().cpu().numpy())
-            risk_y_l.append(risk_y.detach().cpu().numpy())
-            emo_y_l.append(emo_y.detach().cpu().numpy())
+        with open(out_dir / "metrics.json", "w", encoding="utf-8") as f:
+            json.dump({"metrics": metrics, "details": details}, f, indent=2)
 
-    risk_logits = np.concatenate(risk_logits_l, axis=0)
-    emo_logits = np.concatenate(emo_logits_l, axis=0)
-    risk_y = np.concatenate(risk_y_l, axis=0)
-    emo_y = np.concatenate(emo_y_l, axis=0)
+        _plot_confusion(details["risk_confusion"], ckpt["risk_classes"], "Risk Confusion", out_dir / "risk_confusion.png")
+        _plot_confusion(details["emotion_confusion"], ckpt["emotion_classes"], "Emotion Confusion", out_dir / "emotion_confusion.png")
 
-    mb, details = compute_metrics(risk_logits, risk_y, emo_logits, emo_y, ckpt["risk_classes"], ckpt["emotion_classes"])
-    metrics = {
-        "risk_f1_macro": mb.risk_f1_macro,
-        "risk_f1_weighted": mb.risk_f1_weighted,
-        "risk_recall_high": mb.risk_recall_high,
-        "risk_roc_auc_ovr": mb.risk_roc_auc_ovr,
-        "emotion_f1_macro": mb.emotion_f1_macro,
-        "emotion_acc": mb.emotion_acc,
-    }
-
-    with open(out_dir / "metrics.json", "w", encoding="utf-8") as f:
-        json.dump({"metrics": metrics, "details": details}, f, indent=2)
-
-    _plot_confusion(details["risk_confusion"], ckpt["risk_classes"], "Risk Confusion", out_dir / "risk_confusion.png")
-    _plot_confusion(details["emotion_confusion"], ckpt["emotion_classes"], "Emotion Confusion", out_dir / "emotion_confusion.png")
-
-    print("OK:")
-    for k, v in metrics.items():
-        print(f"  {k}: {v}")
+        print("OK:")
+        for k, v in metrics.items():
+            print(f"  {k}: {v}")
 
     return 0
 

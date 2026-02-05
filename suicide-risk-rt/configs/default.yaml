@@ -6,10 +6,64 @@ project:
   model_dir: models
 
 data:
+  # mode: single | multitask
+  # - single: one dataset provides both risk+emotion labels (toy or custom)
+  # - multitask: two separate datasets (risk-only + emotion-only), trained with alternating batches
+  mode: single
   # source: toy | hf | csv | jsonl
   source: toy
   # Must be explicitly set to true before using non-toy datasets.
   dataset_confirmed: false
+  # Optional: record external dataset details for your report/audit trail.
+  confirmation:
+    risk_dataset_name: ""
+    risk_source: ""
+    risk_license: ""
+    emotion_dataset_name: ""
+    emotion_source: ""
+    emotion_license: ""
+
+  # Multitask local datasets (used only when data.mode=multitask)
+  multitask:
+    risk:
+      # format: csv | jsonl | xlsx (inferred from file extension if omitted)
+      format: ""
+      train_path: ""
+      val_path: ""
+      test_path: ""
+      text_field: "text"
+      label_field: "label"
+      user_field: "user_id"
+      time_field: "timestamp"
+      # Optional explicit mapping for string labels (recommended).
+      # Example: {"non-suicide": 0, "suicide": 1}
+      label_map: {}
+      # Optional caps to make very large datasets manageable.
+      max_train_samples: -1
+      max_val_samples: -1
+      max_test_samples: -1
+    emotion:
+      format: ""
+      train_path: ""
+      val_path: ""
+      test_path: ""
+      text_field: "text"
+      label_field: "emotion"
+      user_field: "user_id"
+      time_field: "timestamp"
+      # Optional explicit mapping for string emotion labels.
+      # If empty, labels.emotion_classes order is used.
+      label_map: {}
+      max_train_samples: -1
+      max_val_samples: -1
+      max_test_samples: -1
+
+  cleaning:
+    # Drop low-information / placeholder rows before caching/training.
+    drop_deleted: true
+    min_text_len: 10
+    # If true, drops duplicate texts within each split.
+    deduplicate: false
   # hf:
   hf_dataset_name: ""
   hf_dataset_config: ""

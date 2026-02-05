@@ -9,7 +9,7 @@ sys.path.insert(0, str(_ROOT / "src"))
 import argparse
 from pathlib import Path
 
-from srrtd.data.loader import DatasetConfirmationRequired, load_dataset_bundle
+from srrtd.data.loader import DatasetConfirmationRequired, load_dataset_bundle, load_multitask_bundles
 from srrtd.utils.config import apply_overrides, load_yaml, resolve_paths
 from srrtd.utils.seed import set_global_seed
 
@@ -30,6 +30,18 @@ def main() -> int:
     set_global_seed(seed)
 
     try:
+        mode = str(cfg.get("data", {}).get("mode", "single")).lower()
+        if mode == "multitask":
+            risk_bundle, emo_bundle = load_multitask_bundles(cfg, root)
+            print(
+                "OK risk: "
+                f"train={len(risk_bundle.train.records)} val={len(risk_bundle.val.records)} test={len(risk_bundle.test.records)}"
+            )
+            print(
+                "OK emotion: "
+                f"train={len(emo_bundle.train.records)} val={len(emo_bundle.val.records)} test={len(emo_bundle.test.records)}"
+            )
+            return 0
         bundle = load_dataset_bundle(cfg, root)
     except DatasetConfirmationRequired as e:
         raise SystemExit(str(e))

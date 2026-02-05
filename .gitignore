@@ -1,0 +1,31 @@
+# Python / venv
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Packaging artifacts
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+.env
+
+# Notebooks
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
+
+# Project artifacts (repo contains suicide-risk-rt as a subfolder)
+suicide-risk-rt/.venv*/
+suicide-risk-rt/outputs/
+suicide-risk-rt/models/
+suicide-risk-rt/data/processed/
+suicide-risk-rt/data/raw/**
+!suicide-risk-rt/data/raw/.gitkeep
