@@ -17,7 +17,11 @@ import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+try:
+    from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+except ImportError:  # pragma: no cover
+    from transformers.models.auto.tokenization_auto import AutoTokenizer
+    from transformers.optimization import get_linear_schedule_with_warmup
 
 from srrtd.data.loader import DatasetConfirmationRequired, load_dataset_bundle, load_multitask_bundles
 from srrtd.data.torch_dataset import StreamingPostDataset, collate_tokenized
@@ -62,6 +66,7 @@ def main() -> int:
 
     mode = str(cfg.get("data", {}).get("mode", "single")).lower()
     try:
+        print(f"DATA: mode={mode} loading bundles...")
         if mode == "multitask":
             risk_bundle, emo_bundle = load_multitask_bundles(cfg, root)
             bundle = None
@@ -70,6 +75,14 @@ def main() -> int:
             risk_bundle, emo_bundle = None, None
     except DatasetConfirmationRequired as e:
         raise SystemExit(str(e))
+
+    if mode == "multitask":
+        print(
+            "DATA: loaded multitask bundles "
+            f"risk_train={len(risk_bundle.train.records)} emotion_train={len(emo_bundle.train.records)}"
+        )
+    else:
+        print(f"DATA: loaded single bundle train={len(bundle.train.records)}")
 
     device = resolve_device(str(cfg.get("project", {}).get("device", "auto")))
 
@@ -80,6 +93,7 @@ def main() -> int:
     model.train()
 
     if args.init_ckpt:
+        print(f"INIT: loading init checkpoint '{args.init_ckpt}'...")
         init_path = (root / str(args.init_ckpt)).resolve() if not Path(str(args.init_ckpt)).is_absolute() else Path(str(args.init_ckpt))
         try:
             init_ckpt = torch.load(init_path, map_location="cpu", weights_only=True)
@@ -101,22 +115,40 @@ def main() -> int:
                     f"ckpt={ckpt_emo} cfg={list(model_cfg.emotion_classes)}"
                 )
 
-            load_res = model.load_state_dict(init_ckpt["state_dict"], strict=False)
+            # Robust partial load: skip any tensors whose shapes don't match the current model.
+            # This is critical when emotion/risk label spaces differ across runs.
+            cur_sd = model.state_dict()
+            raw_sd = init_ckpt["state_dict"]
+            filtered_sd = {}
+            skipped = []
+            for k, v in raw_sd.items():
+                if k not in cur_sd:
+                    continue
+                try:
+                    if hasattr(v, "shape") and hasattr(cur_sd[k], "shape") and tuple(v.shape) != tuple(cur_sd[k].shape):
+                        skipped.append(k)
+                        continue
+                except Exception:
+                    # If shape check fails for any reason, skip conservatively.
+                    skipped.append(k)
+                    continue
+                filtered_sd[k] = v
+
+            load_res = model.load_state_dict(filtered_sd, strict=False)
             missing = getattr(load_res, "missing_keys", [])
             unexpected = getattr(load_res, "unexpected_keys", [])
-            if missing or unexpected:
-                print(
-                    "INIT_CKPT loaded with non-identical arch: "
-                    f"missing_keys={len(missing)} unexpected_keys={len(unexpected)}"
-                )
-            else:
-                print("INIT_CKPT loaded.")
+            print(
+                "INIT_CKPT loaded (filtered by shape): "
+                f"loaded={len(filtered_sd)} skipped_shape_mismatch={len(skipped)} "
+                f"missing_keys={len(missing)} unexpected_keys={len(unexpected)}"
+            )
         else:
             raise SystemExit(f"Invalid init checkpoint format (missing 'state_dict'): {init_path}")
 
     # Optional RAG
     rag = None
     if model_cfg.use_rag:
+        print("RAG: initializing retriever (this may take time on first run)...")
         rag_cfg_d = dict(cfg.get("model", {}).get("rag", {}) or {})
         rag_cfg = RagConfig(
             embed_model=str(rag_cfg_d.get("embed_model")),
@@ -126,11 +158,17 @@ def main() -> int:
             collection=str(rag_cfg_d.get("collection")),
         )
         rag = RagRetriever(rag_cfg, root)
+        try:
+            if hasattr(rag.collection, "count"):
+                print(f"RAG: collection='{rag_cfg.collection}' count={int(rag.collection.count())}")
+        except Exception:
+            print(f"RAG: collection='{rag_cfg.collection}' ready")
 
     # Optional GNN
     gnn_ctx = None
     graph = None
     if model_cfg.use_gnn:
+        print("GNN: building community graph...")
         if mode == "multitask":
             recs = _as_records(risk_bundle) + _as_records(emo_bundle)
         else:
@@ -140,6 +178,10 @@ def main() -> int:
             seed=seed,
             max_neighbors=int(cfg.get("model", {}).get("gnn", {}).get("max_neighbors", 16)),
         )
+        try:
+            print(f"GNN: graph users={len(graph.adj)}")
+        except Exception:
+            pass
         fused_dim = int(model.encoder.config.hidden_size)
         if model_cfg.use_memory:
             fused_dim += int(model_cfg.memory.user_state_dim)
@@ -207,6 +249,26 @@ def main() -> int:
     run_dir = paths.outputs / str(args.run_name)
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    # Persist community graph used for this run (so API/dashboard can reproduce GNN behavior
+    # without rebuilding from the full dataset).
+    if graph is not None:
+        try:
+            with open(run_dir / "community_graph.json", "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "version": 2,
+                        "meta": {
+                            "seed": int(seed),
+                            "max_neighbors": int(cfg.get("model", {}).get("gnn", {}).get("max_neighbors", 16)),
+                        },
+                        "adj": graph.adj,
+                    },
+                    f,
+                )
+        except Exception:
+            # Non-fatal: training can proceed even if graph serialization fails.
+            pass
+
     best_val = -1.0
     best_epoch = -1
     best_metrics: dict | None = None
@@ -227,6 +289,7 @@ def main() -> int:
         emo_iter = _infinite(dl_train_emo)
 
     for epoch in range(1, epochs + 1):
+        print(f"EPOCH {epoch}/{epochs}")
         model.train()
         if gnn_ctx is not None:
             gnn_ctx.train()
@@ -487,6 +550,7 @@ def main() -> int:
                 "version": 1,
                 "model_cfg": safe_model_cfg,
                 "state_dict": model.state_dict(),
+                "gnn_state_dict": (gnn_ctx.state_dict() if gnn_ctx is not None else None),
                 "risk_classes": (risk_bundle or bundle).risk_classes,
                 "emotion_classes": (emo_bundle or bundle).emotion_classes,
                 "tokenizer_name": model_cfg.encoder_name,

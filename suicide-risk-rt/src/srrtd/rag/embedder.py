@@ -13,8 +13,25 @@ class SentenceTransformerEmbedder:
     def __init__(self, cfg: EmbedderConfig):
         from sentence_transformers import SentenceTransformer
 
+        device = "cpu"
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                device = "cuda"
+        except Exception:
+            device = "cpu"
+
         self.cfg = cfg
-        self.model = SentenceTransformer(cfg.model_name)
+        # Prefer GPU if available. Some older versions may not accept `device=`.
+        try:
+            self.model = SentenceTransformer(cfg.model_name, device=device)
+        except TypeError:
+            self.model = SentenceTransformer(cfg.model_name)
+            try:
+                self.model.to(device)
+            except Exception:
+                pass
 
     @property
     def dim(self) -> int:

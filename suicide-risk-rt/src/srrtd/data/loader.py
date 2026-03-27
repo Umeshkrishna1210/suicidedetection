@@ -361,11 +361,38 @@ def _load_multitask_task_bundle(
     df_val = _read_table(val_path, fmt)
     df_test = _read_table(test_path, fmt)
 
+    # Optional: merge extra training sources (commonly used for "hard negatives" to reduce keyword false positives).
+    # Only applied to the risk task and only to the train split.
+    extra_train_records: list[PostRecord] = []
+    if task == "risk":
+        extra_paths = task_cfg.get("extra_train_paths", [])
+        if isinstance(extra_paths, (str, Path)):
+            extra_paths = [str(extra_paths)]
+        extra_paths = [str(p).strip() for p in (extra_paths or []) if str(p).strip()]
+        extra_repeat = int(task_cfg.get("extra_train_repeat", 1))
+        extra_repeat = max(0, extra_repeat)
+        max_extra = int(task_cfg.get("max_extra_train_samples", -1))
+
+        if extra_paths and extra_repeat > 0:
+            for j, p in enumerate(extra_paths):
+                ep = rp(str(p))
+                efmt = _infer_format(ep, task_cfg.get("format"))
+                if efmt != fmt:
+                    raise ValueError(f"extra_train_paths format must match '{fmt}' for task '{task}': {ep}")
+                df_extra = _read_table(ep, fmt)
+                df_extra = _maybe_cap(df_extra, max_extra, seed)
+                extra_train_records.extend(to_records(df_extra, f"extra_train_{j}"))
+
+            if extra_train_records:
+                extra_train_records = extra_train_records * int(extra_repeat)
+
     df_train = _maybe_cap(df_train, max_train, seed)
     df_val = _maybe_cap(df_val, max_val, seed)
     df_test = _maybe_cap(df_test, max_test, seed)
 
     train_records = to_records(df_train, "train")
+    if extra_train_records:
+        train_records.extend(extra_train_records)
     val_records = to_records(df_val, "val")
     test_records = to_records(df_test, "test")
 

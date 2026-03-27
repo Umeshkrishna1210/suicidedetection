@@ -20,6 +20,7 @@ class MetricBundle:
     risk_f1_weighted: float
     risk_recall_high: float
     risk_roc_auc_ovr: float | None
+    risk_acc: float
     emotion_f1_macro: float
     emotion_acc: float
 
@@ -30,6 +31,7 @@ class RiskMetricBundle:
     risk_f1_weighted: float
     risk_recall_high: float
     risk_roc_auc_ovr: float | None
+    risk_acc: float
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,7 @@ def compute_metrics(
     risk_f1_weighted = float(f1_score(risk_y, risk_pred, average="weighted", labels=risk_labels, zero_division=0))
     high_idx = len(risk_classes) - 1
     risk_recall_high = float(recall_score((risk_y == high_idx).astype(int), (risk_pred == high_idx).astype(int)))
+    risk_acc = float(accuracy_score(risk_y, risk_pred))
 
     # ROC AUC OVR if possible
     risk_auc: float | None
@@ -103,6 +106,7 @@ def compute_metrics(
             risk_f1_weighted=risk_f1_weighted,
             risk_recall_high=risk_recall_high,
             risk_roc_auc_ovr=risk_auc,
+            risk_acc=risk_acc,
             emotion_f1_macro=emo_f1_macro,
             emotion_acc=emo_acc,
         ),
@@ -122,6 +126,7 @@ def compute_risk_metrics(
     risk_f1_weighted = float(f1_score(risk_y, risk_pred, average="weighted", labels=risk_labels, zero_division=0))
     high_idx = len(risk_classes) - 1
     risk_recall_high = float(recall_score((risk_y == high_idx).astype(int), (risk_pred == high_idx).astype(int)))
+    risk_acc = float(accuracy_score(risk_y, risk_pred))
 
     risk_auc: float | None
     try:
@@ -149,6 +154,7 @@ def compute_risk_metrics(
             risk_f1_weighted=risk_f1_weighted,
             risk_recall_high=risk_recall_high,
             risk_roc_auc_ovr=risk_auc,
+            risk_acc=risk_acc,
         ),
         details,
     )

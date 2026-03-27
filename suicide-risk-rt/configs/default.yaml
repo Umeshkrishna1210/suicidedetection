@@ -38,6 +38,13 @@ data:
       # Optional explicit mapping for string labels (recommended).
       # Example: {"non-suicide": 0, "suicide": 1}
       label_map: {}
+      # Optional: extra training CSVs to merge into risk train split (e.g., "hard negatives").
+      # Uses the same text_field/label_field mapping.
+      extra_train_paths: []
+      # If >1, repeats extra records to increase their weight.
+      extra_train_repeat: 1
+      # Optional cap applied to each extra file before repeat.
+      max_extra_train_samples: -1
       # Optional caps to make very large datasets manageable.
       max_train_samples: -1
       max_val_samples: -1

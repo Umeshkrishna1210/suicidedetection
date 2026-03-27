@@ -52,13 +52,23 @@ class RagRetriever:
 
         ctx_vecs: list[np.ndarray] = []
         # res["embeddings"]: list[batch][k][dim]
+        embeddings = res.get("embeddings", None)
         for i in range(len(texts)):
-            embs = res.get("embeddings", [[]])[i] or []
-            if not embs:
+            if embeddings is None or i >= len(embeddings) or embeddings[i] is None:
                 ctx_vecs.append(np.zeros((int(self.cfg.embed_dim),), dtype=np.float32))
                 continue
-            arr = np.asarray(embs, dtype=np.float32)
-            ctx_vecs.append(arr.mean(axis=0))
+
+            arr = np.asarray(embeddings[i], dtype=np.float32)
+            if arr.size == 0:
+                ctx_vecs.append(np.zeros((int(self.cfg.embed_dim),), dtype=np.float32))
+                continue
+
+            # Allow either a single embedding (dim,) or a set (k, dim)
+            if arr.ndim == 1:
+                ctx_vecs.append(arr)
+            else:
+                arr2 = arr.reshape((-1, arr.shape[-1]))
+                ctx_vecs.append(arr2.mean(axis=0))
 
         ctx = np.stack(ctx_vecs, axis=0)
         return torch.tensor(ctx, dtype=torch.float32, device=device)

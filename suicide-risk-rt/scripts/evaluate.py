@@ -16,7 +16,10 @@ import seaborn as sns
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoTokenizer
+try:
+    from transformers import AutoTokenizer
+except ImportError:  # pragma: no cover
+    from transformers.models.auto.tokenization_auto import AutoTokenizer
 
 from srrtd.data.loader import DatasetConfirmationRequired, load_dataset_bundle, load_multitask_bundles
 from srrtd.data.torch_dataset import StreamingPostDataset, collate_tokenized
@@ -105,6 +108,18 @@ def main() -> int:
     gnn_ctx = None
     graph = None
     if model_cfg.use_gnn:
+        # Prefer the exact graph used during training if saved next to the checkpoint.
+        graph_json = ckpt_path.parent / "community_graph.json"
+        if graph_json.exists():
+            try:
+                with open(graph_json, "r", encoding="utf-8") as f:
+                    g = json.load(f)
+                if isinstance(g, dict) and isinstance(g.get("adj"), dict):
+                    graph = CommunityGraph()
+                    graph.adj = {str(k): [str(x) for x in (v or [])] for k, v in (g.get("adj") or {}).items()}
+            except Exception:
+                graph = None
+
         recs = []
         if mode == "multitask":
             for split in (risk_bundle.train, risk_bundle.val, risk_bundle.test):
@@ -117,11 +132,12 @@ def main() -> int:
             for split in (bundle.train, bundle.val, bundle.test):
                 for r in split.records:
                     recs.append({"user_id": r.user_id, "lang": r.lang, "timestamp": r.timestamp})
-        graph = CommunityGraph.build_from_records(
-            records=recs,
-            seed=seed,
-            max_neighbors=int(cfg.get("model", {}).get("gnn", {}).get("max_neighbors", 16)),
-        )
+        if graph is None:
+            graph = CommunityGraph.build_from_records(
+                records=recs,
+                seed=seed,
+                max_neighbors=int(cfg.get("model", {}).get("gnn", {}).get("max_neighbors", 16)),
+            )
         fused_dim = int(model.encoder.config.hidden_size)
         if model_cfg.use_memory:
             fused_dim += int(model_cfg.memory.user_state_dim)
@@ -130,7 +146,16 @@ def main() -> int:
             fused_dim=fused_dim,
             gnn_cfg=model_cfg.gnn,
         ).to(device)
-        gnn_ctx.eval()
+        gnn_sd = ckpt.get("gnn_state_dict") if isinstance(ckpt, dict) else None
+        if isinstance(gnn_sd, dict):
+            gnn_ctx.load_state_dict(gnn_sd, strict=False)
+        else:
+            # Avoid using random GNN weights during evaluation.
+            print("WARN: use_gnn=true but checkpoint missing gnn_state_dict; disabling GNN for evaluation.")
+            gnn_ctx = None
+            graph = None
+        if gnn_ctx is not None:
+            gnn_ctx.eval()
 
     out_dir = (root / args.out).resolve() if not Path(args.out).is_absolute() else Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)

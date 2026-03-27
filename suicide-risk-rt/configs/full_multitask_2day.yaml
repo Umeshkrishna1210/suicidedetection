@@ -1,7 +1,7 @@
 project:
   name: srrtd
   seed: 42
-  device: cuda
+  device: auto
   output_dir: outputs
   model_dir: models
 
@@ -19,43 +19,32 @@ data:
 
   multitask:
     risk:
-      # Put these files under data/raw/risk/
       train_path: data/raw/risk/train.csv
       val_path: data/raw/risk/val.csv
       test_path: data/raw/risk/test.csv
       text_field: text
       label_field: class
-      # Recommended: explicit mapping so labels never get misread.
-      # Example values shown; replace to match your CSV exactly.
       label_map:
         non-suicide: 0
         suicide: 1
-      # Optional: add a small "hard negatives" set (protective/negated sentences) into risk training.
-      # This reduces keyword false-positives like: "I am not suicidal, I want to live".
       extra_train_paths: [data/raw/risk/hard_negatives.csv]
-      # Repeat to give it weight relative to the huge main dataset.
-      extra_train_repeat: 1
+      extra_train_repeat: 5
       max_extra_train_samples: -1
-      # Cap for fast, reproducible final runs.
-      max_train_samples: 30000
-      max_val_samples: 5000
-      max_test_samples: 5000
+      # Use more data (increase further if RAM/time allow).
+      max_train_samples: 200000
+      max_val_samples: 10000
+      max_test_samples: 10000
 
     emotion:
-      # Put these files under data/raw/emotion/
       train_path: data/raw/emotion/train.csv
       val_path: data/raw/emotion/val.csv
       test_path: data/raw/emotion/test.csv
       text_field: text
       label_field: label
-      # If your emotion labels are already integers, you can omit label_map.
-      # If they are strings, either fill label_map OR set labels.emotion_classes below.
-      # label_map:
-      #   happines: 1
-      #   sad: 3
-      max_train_samples: 120000
-      max_val_samples: 5000
-      max_test_samples: 5000
+      # Use more data (increase further if RAM/time allow).
+      max_train_samples: 200000
+      max_val_samples: 10000
+      max_test_samples: 10000
 
   cleaning:
     drop_deleted: true
@@ -71,9 +60,7 @@ privacy:
   max_chars: 2048
 
 labels:
-  # For binary risk:
   risk_classes: ["non-suicide", "suicide"]
-  # Emotion labels (canonical). Your dataset has 7 core labels + a rare 'excited'.
   emotion_classes: ["sadness", "joy", "love", "anger", "fear", "surprise"]
 
 model:
@@ -101,22 +88,24 @@ model:
 
 train:
   batch_size: 16
-  lr: 1.0e-5
+  lr: 2.0e-5
   weight_decay: 0.01
-  epochs: 8
+  # Keep epochs high; max_steps is the true runtime cap.
+  epochs: 50
   warmup_ratio: 0.06
   fp16: true
   grad_accum: 1
-  # Hard cap so we never waste time on huge runs.
-  max_steps: 12000
+  # ~30k steps at ~5s/step ≈ 42 hours (+val) on your setup.
+  max_steps: 30000
   loss_weights:
     risk: 1.0
     emotion: 1.0
   multitask:
-    # Probability that a training step uses an emotion batch (else uses risk batch).
-    p_emotion: 0.6
-    # If set > 0, overrides default steps_per_epoch (which is len(risk_train_loader)).
-    steps_per_epoch: -1
+    # Balanced from-scratch multitask.
+    p_emotion: 0.5
+    # Important: don't let 'epoch' become enormous with 200k+ risk rows.
+    # This keeps validation/checkpointing frequent and predictable.
+    steps_per_epoch: 2000
 
 inference:
   threshold_high: 0.55
