@@ -1,0 +1,6 @@
+python scripts/evaluate.py --config configs/local_multitask.yaml --ckpt outputs/risk_only/best.pt --out outputs/eval_risk_only
+
+.\.venv_gpu\Scripts\Activate.ps1
+
+
+python -m streamlit run Scripts/dashboard.py -- --config configs/full_multitask_2day.yaml --ckpt outputs/final_2day/best.pt         
