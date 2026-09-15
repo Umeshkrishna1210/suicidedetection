@@ -1,31 +1,42 @@
-# Python / venv
-__pycache__/
+# Python environments
+**/.venv/
+**/.venv_gpu/
+**/venv/
+**/env/
+
+# Python cache
+**/__pycache__/
 *.py[cod]
-*.pyo
-*.pyd
 
-# Packaging artifacts
+# Packaging and build artifacts
 *.egg-info/
-build/
-dist/
+**/build/
+**/dist/
 
-# Virtual environments
-.venv/
-venv/
+# Secrets
 .env
+.env.*
+!.env.example
 
-# Notebooks
+# Notebooks and logs
 .ipynb_checkpoints/
-
-# OS / editor
-.DS_Store
-Thumbs.db
 *.log
 
-# Project artifacts (repo contains suicide-risk-rt as a subfolder)
-suicide-risk-rt/.venv*/
+# Project artifacts
 suicide-risk-rt/outputs/
+suicide-risk-rt/data/
 suicide-risk-rt/models/
-suicide-risk-rt/data/processed/
-suicide-risk-rt/data/raw/**
-!suicide-risk-rt/data/raw/.gitkeep
+suicide-risk-rt/checkpoints/
+
+# Model weights
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Node dependencies
+**/node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db

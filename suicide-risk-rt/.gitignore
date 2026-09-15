@@ -1,15 +1,35 @@
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+# Python environments
 .venv/
+.venv_gpu/
 venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Node.js dependencies
+node_modules/
+
+# Secrets
 .env
-.ipynb_checkpoints/
-outputs/
+.env.*
+!.env.example
+
+# Datasets
+data/
+
+# Model weights and checkpoints
 models/
-data/processed/
-data/raw/**
-!data/raw/.gitkeep
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Build and temporary files
+dist/
+build/
 *.log
+.ipynb_checkpoints/
 .DS_Store

@@ -220,17 +220,17 @@ def main() -> int:
     ap.add_argument("--overrides", nargs="*", default=None)
     args, _unknown = ap.parse_known_args()
 
+    overrides = tuple(args.overrides or [])
+
     st.set_page_config(page_title="SRRTD Dashboard", layout="wide")
 
-    st.title("Suicide Risk + Emotion Dashboard (Research Prototype)")
+    st.title("Suicide Risk and Emotion Dashboard")
     st.caption("Not a diagnosis. Use for research/demo only.")
 
     with st.sidebar:
-        st.subheader("Model")
+        st.subheader("Suicide Risk and Emotion Detection Model")
         config_path = st.text_input("Config path", value=str(args.config))
         ckpt_path = st.text_input("Checkpoint path", value=str(args.ckpt))
-        overrides_txt = st.text_area("Overrides (space-separated key=value)", value=" ".join(args.overrides or []))
-        overrides = tuple([s for s in overrides_txt.split() if s.strip()])
 
         # Fingerprint config content so Streamlit cache invalidates when the file changes.
         try:
@@ -466,11 +466,11 @@ def main() -> int:
                                 st.write(str(nid))
 
     st.divider()
-    st.subheader("Next steps")
-    st.write(
-        "- Train multitask (p_emotion>0) to make emotion head accurate.\n"
-        "- Evaluate on test with scripts/evaluate.py and compare runs with scripts/aggregate_results.py."
-    )
+    # st.subheader("Next steps")
+    # st.write(
+    #     "- Train multitask (p_emotion>0) to make emotion head accurate.\n"
+    #     "- Evaluate on test with scripts/evaluate.py and compare runs with scripts/aggregate_results.py."
+    # )
 
     return 0
 
